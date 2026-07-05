@@ -1,0 +1,6 @@
+beautifulsoup4
+faiss-cpu
+google-genai
+numpy
+sentence-transformers
+tqdm
