@@ -264,6 +264,59 @@ def parse_by_legal_markers(html_path: Path) -> list[dict]:
     return records
 
 
+def split_record_by_legal_markers(record: dict, strategy: str) -> list[dict]:
+    text = normalize_text(record.get("text"))
+    if not text:
+        return []
+
+    sections: list[tuple[str, str]] = []
+    current_section = record.get("section") or "本文"
+    current_parts: list[str] = []
+
+    def flush() -> None:
+        nonlocal current_parts
+        section_text = "\n".join(current_parts)
+        if normalize_text(section_text):
+            sections.append((current_section, section_text))
+        current_parts = []
+
+    for line in text.splitlines():
+        marker = SECTION_MARKER_RE.match(line)
+        if marker:
+            flush()
+            marker_name = marker.group(1)
+            parent_section = record.get("section") or "本文"
+            current_section = marker_name if marker_name in parent_section else f"{parent_section} / {marker_name}"
+            continue
+        current_parts.append(line)
+
+    flush()
+
+    if len(sections) <= 1:
+        return [{**record, "parse_strategy": strategy}]
+
+    records: list[dict] = []
+    for index, (section, section_text) in enumerate(sections):
+        split_record = make_record(record, section, section_text, index, strategy)
+        if split_record and (len(split_record["text"]) >= 30 or split_record["is_important"]):
+            records.append(split_record)
+    return records
+
+
+def parse_by_headings_legal_hybrid(html_path: Path) -> list[dict]:
+    records: list[dict] = []
+
+    for record in parse_by_headings(html_path):
+        marker_splits = split_record_by_legal_markers(record, "headings_legal_hybrid")
+        if len(marker_splits) > 1:
+            records.extend(marker_splits)
+            continue
+
+        records.append({**record, "parse_strategy": "headings_legal_hybrid"})
+
+    return records
+
+
 def split_sentences(text: str) -> list[str]:
     sentences: list[str] = []
     for line in normalize_text(text).splitlines():
@@ -469,15 +522,14 @@ def candidate_strategies() -> list[ParseStrategy]:
     return [
         ParseStrategy("html_sections", "HTMLのsection/main/article/body単位を尊重する", parse_by_html_sections),
         ParseStrategy("headings", "h1-h4見出し配下で本文をまとめる", parse_by_headings),
+        ParseStrategy("headings_legal_hybrid", "h1-h4見出しで分けた後に主文・理由などの法的見出しで再分割する", parse_by_headings_legal_hybrid),
         ParseStrategy("legal_markers", "主文・理由などの法的見出し行で分割する", parse_by_legal_markers),
         ParseStrategy("sentence_windows", "文単位の固定窓でRAG向け粒度を安定させる", parse_by_sentence_windows),
         ParseStrategy("dom_blocks", "末端DOMブロック単位で細かく分割する", parse_by_dom_blocks),
     ]
 
 
-def iter_html_paths(input_path: Path, limit: int | None = None) -> Iterable[Path]:
-    count = 0
-
+def iter_html_paths(input_path: Path) -> Iterable[Path]:
     if input_path.is_file():
         if input_path.suffix.lower() in {".html", ".htm"}:
             yield input_path
@@ -489,9 +541,32 @@ def iter_html_paths(input_path: Path, limit: int | None = None) -> Iterable[Path
     for path in sorted(input_path.rglob("*")):
         if path.is_file() and path.suffix.lower() in {".html", ".htm"}:
             yield path
-            count += 1
-            if limit is not None and count >= limit:
-                return
+
+
+def select_html_paths(
+    input_path: Path,
+    *,
+    limit: int | None = None,
+    sample: str | None = None,
+    sample_size: int | None = None,
+) -> list[Path]:
+    html_paths = list(iter_html_paths(input_path))
+
+    if sample:
+        size = sample_size or limit or 500
+        if sample == "first":
+            html_paths = html_paths[:size]
+        elif sample == "middle":
+            start = max((len(html_paths) - size) // 2, 0)
+            html_paths = html_paths[start : start + size]
+        elif sample == "last":
+            html_paths = html_paths[-size:]
+        else:
+            raise ValueError(f"unknown sample: {sample}")
+    elif limit is not None:
+        html_paths = html_paths[:limit]
+
+    return html_paths
 
 
 def safe_ratio(numerator: float, denominator: float) -> float:
@@ -582,8 +657,14 @@ def write_jsonl(path: Path, records: Iterable[dict]) -> int:
     return count
 
 
-def explore(input_path: Path, *, limit: int | None = None) -> dict:
-    html_paths = list(iter_html_paths(input_path, limit=limit))
+def explore(
+    input_path: Path,
+    *,
+    limit: int | None = None,
+    sample: str | None = None,
+    sample_size: int | None = None,
+) -> dict:
+    html_paths = select_html_paths(input_path, limit=limit, sample=sample, sample_size=sample_size)
     if not html_paths:
         raise ValueError(f"no HTML files found under: {input_path}")
 
@@ -616,17 +697,25 @@ def explore(input_path: Path, *, limit: int | None = None) -> dict:
     strategy_results.sort(key=lambda item: item["aggregate"]["score"], reverse=True)
     return {
         "input_path": str(input_path),
+        "sample": sample or ("limit" if limit is not None else "all"),
+        "sample_size": sample_size,
         "file_count": len(html_paths),
         "best_strategy": strategy_results[0]["strategy"],
         "strategies": strategy_results,
     }
 
 
-def records_for_strategy(strategy_name: str, input_path: Path, limit: int | None) -> Iterable[dict]:
+def records_for_strategy(
+    strategy_name: str,
+    input_path: Path,
+    limit: int | None,
+    sample: str | None = None,
+    sample_size: int | None = None,
+) -> Iterable[dict]:
     strategies = {strategy.name: strategy for strategy in candidate_strategies()}
     strategy = strategies[strategy_name]
 
-    for html_path in iter_html_paths(input_path, limit=limit):
+    for html_path in select_html_paths(input_path, limit=limit, sample=sample, sample_size=sample_size):
         records = strategy.parser(html_path)
         for record in records:
             yield record
@@ -641,6 +730,8 @@ def run_explorer(
     cases: str | Path,
     *,
     limit: int | None = None,
+    sample: str | None = None,
+    sample_size: int | None = None,
     report_out: str | Path | None = None,
     best_jsonl_out: str | Path | None = None,
     best_chunks_out: str | Path | None = None,
@@ -648,9 +739,11 @@ def run_explorer(
     """Notebook-friendly entry point, useful when case data lives on Google Drive."""
 
     cases_path = Path(cases)
-    report = explore(cases_path, limit=limit)
+    report = explore(cases_path, limit=limit, sample=sample, sample_size=sample_size)
     best = report["best_strategy"]
-    best_records = list(records_for_strategy(best, cases_path, limit))
+    best_records = list(
+        records_for_strategy(best, cases_path, limit, sample=sample, sample_size=sample_size)
+    )
 
     if report_out:
         report_path = Path(report_out)
@@ -672,6 +765,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--cases", type=Path, help="HTML file or directory containing case HTML files.")
     parser.add_argument("--limit", type=int, help="Evaluate only the first N HTML files.")
+    parser.add_argument("--sample", choices=["first", "middle", "last"], help="Evaluate a positional sample.")
+    parser.add_argument("--sample-size", type=int, default=500, help="Number of HTML files to use with --sample.")
     parser.add_argument("--report-out", type=Path, help="Write the strategy comparison report as JSON.")
     parser.add_argument("--best-jsonl-out", type=Path, help="Write records from the best strategy as JSONL.")
     parser.add_argument("--best-chunks-out", type=Path, help="Write chunked records from the best strategy as JSONL.")
@@ -691,6 +786,8 @@ def main() -> None:
     report = run_explorer(
         args.cases,
         limit=args.limit,
+        sample=args.sample,
+        sample_size=args.sample_size,
         report_out=args.report_out,
         best_jsonl_out=args.best_jsonl_out,
         best_chunks_out=args.best_chunks_out,
